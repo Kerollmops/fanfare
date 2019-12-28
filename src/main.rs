@@ -65,6 +65,7 @@ impl Code {
 enum Opt {
     Write(WriteOpt),
     Read(ReadOpt),
+    Infos(InfosOpt),
 }
 
 #[derive(StructOpt)]
@@ -75,6 +76,12 @@ struct WriteOpt {
 
 #[derive(StructOpt)]
 struct ReadOpt {
+    #[structopt(short, long, parse(from_os_str))]
+    database: PathBuf,
+}
+
+#[derive(StructOpt)]
+struct InfosOpt {
     #[structopt(short, long, parse(from_os_str))]
     database: PathBuf,
 }
@@ -253,10 +260,35 @@ fn read_from_database(opt: ReadOpt) -> Result<(), MainError> {
     Ok(())
 }
 
+fn infos_of_database(opt: InfosOpt) -> Result<(), MainError> {
+    let env = EnvOpenOptions::new()
+        .map_size(10 * 1024 * 1024 * 1024) // 10GB
+        .open(opt.database)?;
+
+    let db = match env.open_database::<OwnedType<BEU64>, ByteSlice>(None)? {
+        Some(db) => db,
+        None => return Err("database not found".into()),
+    };
+
+    let rtxn = env.read_txn()?;
+    let code = db.get(&rtxn, &BEU64::new(0))?;
+    if let Some(code) = code {
+        let code = str::from_utf8(code)?;
+        println!("values code: {}", code);
+    }
+
+    let len = db.len(&rtxn)?;
+    let len = len.saturating_sub(1);
+    println!("number of entries: {}", len);
+
+    Ok(())
+}
+
 // oceanic-airlines 2001-01-13T12:09:14.026490 ff 37.686751 -122.602227
 fn main() -> Result<(), MainError> {
     match Opt::from_args() {
         Opt::Write(opt) => write_to_database(opt),
         Opt::Read(opt) => read_from_database(opt),
+        Opt::Infos(opt) => infos_of_database(opt),
     }
 }
