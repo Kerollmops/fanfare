@@ -78,6 +78,8 @@ struct WriteOpt {
 struct ReadOpt {
     #[structopt(short, long, parse(from_os_str))]
     database: PathBuf,
+    #[structopt(long)]
+    filter: Option<glob::Pattern>,
 }
 
 #[derive(StructOpt)]
@@ -217,6 +219,12 @@ fn read_from_database(opt: ReadOpt) -> Result<(), MainError> {
         };
 
         let text = str::from_utf8(&bytes[value_size..])?;
+
+        if let Some(pattern) = opt.filter.as_ref() {
+            if !pattern.matches(text) {
+                continue
+            }
+        }
 
         write!(&mut writer, "{} {} ", text, dt)?;
 
