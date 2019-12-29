@@ -175,7 +175,7 @@ fn write_to_database(opt: WriteOpt) -> Result<(), MainError> {
             }
         }
 
-        match db.append(&mut wtxn, &(text, nanos), &buffer) {
+        match db.put(&mut wtxn, &(text, nanos), &buffer) {
             Ok(()) => (),
             Err(Error::Lmdb(LmdbError::KeyExist)) => {
                 return Err("inserted value not ordered".into())
