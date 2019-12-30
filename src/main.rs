@@ -199,15 +199,23 @@ fn read_from_database(opt: ReadOpt) -> Result<(), MainError> {
         None => return Err("database not found".into()),
     };
 
-    let rtxn = env.read_txn()?;
-    let mut iter = db.iter(&rtxn)?;
 
-    let code = match iter.next() {
-        Some(result) => {
-            let (_, code) = result?;
-            code
-        },
+    let rtxn = env.read_txn()?;
+
+    let code = match db.first(&rtxn)? {
+        Some((_, code)) => code,
         None => return Ok(()),
+    };
+
+    let iter = match opt.filter.as_ref() {
+        // if the pattern doesn't contain any glob syntax
+        Some(pattern) if pattern.as_str() == glob::Pattern::escape(pattern.as_str()) => {
+            let start = (pattern.as_str(), 0);
+            let end = (pattern.as_str(), u64::max_value());
+            db.range(&rtxn, &(start..=end))?
+        },
+        // skip the first entry (that contains the code)
+        _ => db.range(&rtxn, &(("", 1)..))?,
     };
 
     let codes = code.iter().map(|c| Code::from(*c).unwrap());
