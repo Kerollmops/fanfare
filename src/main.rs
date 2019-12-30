@@ -1,21 +1,21 @@
+use std::borrow::Cow;
+use std::convert::TryInto;
 use std::io::{self, Write, BufRead, BufReader, BufWriter, Cursor};
+use std::iter::FromIterator;
 use std::mem;
 use std::path::PathBuf;
 use std::str::{self, FromStr};
 
 use byteorder::{BigEndian, ReadBytesExt};
 use chrono::NaiveDateTime;
-use heed::byteorder::BE;
 use heed::{EnvOpenOptions, Error, LmdbError};
 use heed::types::*;
-use heed::zerocopy::U64;
 use main_error::MainError;
 use structopt::StructOpt;
 
 const ONE_BILLION: u64 = 1_000_000_000;
 const DATETIME_FORMAT: &str = "%FT%T%.f";
 
-type BEU64 = U64<BE>;
 type SmallVec8<T> = smallvec::SmallVec<[T; 8]>;
 
 // The character codes are:
@@ -47,21 +47,10 @@ impl Code {
             _ => None,
         }
     }
-
-    fn size(self) -> usize {
-        match self {
-            Code::Float => mem::size_of::<f32>(),
-            Code::Double => mem::size_of::<f64>(),
-            Code::Unsigned => mem::size_of::<u32>(),
-            Code::UnsignedLong => mem::size_of::<u64>(),
-            Code::Signed => mem::size_of::<i32>(),
-            Code::SignedLong => mem::size_of::<i64>(),
-        }
-    }
 }
 
 #[derive(StructOpt)]
-#[structopt(about = "the stupid content tracker")]
+#[structopt(about = "The fanfare timeseries database.")]
 enum Opt {
     Write(WriteOpt),
     Read(ReadOpt),
@@ -88,16 +77,43 @@ struct InfosOpt {
     database: PathBuf,
 }
 
+struct Key;
+
+impl<'a> heed::BytesEncode<'a> for Key {
+    type EItem = (&'a str, u64);
+
+    fn bytes_encode((text, nanos): &Self::EItem) -> Option<Cow<[u8]>> {
+        let mut buffer = Vec::with_capacity(text.len() + mem::size_of::<u64>());
+        buffer.extend_from_slice(text.as_bytes());
+        buffer.extend_from_slice(&nanos.to_be_bytes());
+        Some(Cow::Owned(buffer))
+    }
+}
+
+impl<'a> heed::BytesDecode<'a> for Key {
+    type DItem = (&'a str, u64);
+
+    fn bytes_decode(bytes: &'a [u8]) -> Option<Self::DItem> {
+        let text_len = bytes.len() - mem::size_of::<u64>();
+        let text = str::from_utf8(&bytes[..text_len]).ok()?;
+
+        let nanos_bytes = &bytes[text_len..];
+        let nanos_array = nanos_bytes.try_into().ok()?;
+        let nanos = u64::from_be_bytes(nanos_array);
+
+        Some((text, nanos))
+    }
+}
+
 fn write_to_database(opt: WriteOpt) -> Result<(), MainError> {
     let env = EnvOpenOptions::new()
         .map_size(10 * 1024 * 1024 * 1024) // 10GB
         .open(opt.database)?;
 
-    // let dbinfos = env.create_database::<Str, Str>(Some("infos"))?;
-    let db = env.create_database::<OwnedType<BEU64>, ByteSlice>(None)?;
+    let db = env.create_database::<Key, ByteSlice>(None)?;
     let mut wtxn = env.write_txn()?;
 
-    let mut values_code = db.get(&wtxn, &BEU64::new(0))?.map(ToOwned::to_owned);
+    let mut values_code = db.get(&wtxn, &("", 0))?.map(ToOwned::to_owned);
 
     let mut buffer = Vec::new();
     let reader = BufReader::new(io::stdin());
@@ -116,7 +132,7 @@ fn write_to_database(opt: WriteOpt) -> Result<(), MainError> {
             Some(ref old_code) if &old_code[..] == code.as_bytes() => code,
             Some(_) => return Err("invalid code".into()),
             None => {
-                db.put(&mut wtxn, &BEU64::new(0), code.as_bytes())?;
+                db.put(&mut wtxn, &("", 0), code.as_bytes())?;
                 values_code = Some(code.as_bytes().to_owned());
                 code
             },
@@ -127,7 +143,7 @@ fn write_to_database(opt: WriteOpt) -> Result<(), MainError> {
         }
 
         let dt = NaiveDateTime::parse_from_str(date, DATETIME_FORMAT)?;
-        let nanos = BEU64::new(dt.timestamp_nanos() as u64);
+        let nanos = dt.timestamp_nanos() as u64;
 
         for (c, n) in code.as_bytes().iter().zip(values) {
             match Code::from(*c) {
@@ -159,9 +175,7 @@ fn write_to_database(opt: WriteOpt) -> Result<(), MainError> {
             }
         }
 
-        buffer.extend_from_slice(text.as_bytes());
-
-        match db.append(&mut wtxn, &nanos, &buffer) {
+        match db.append(&mut wtxn, &(text, nanos), &buffer) {
             Ok(()) => (),
             Err(Error::Lmdb(LmdbError::KeyExist)) => {
                 return Err("inserted value not ordered".into())
@@ -180,7 +194,7 @@ fn read_from_database(opt: ReadOpt) -> Result<(), MainError> {
         .map_size(10 * 1024 * 1024 * 1024) // 10GB
         .open(opt.database)?;
 
-    let db = match env.open_database::<OwnedType<BEU64>, ByteSlice>(None)? {
+    let db = match env.open_database::<Key, ByteSlice>(None)? {
         Some(db) => db,
         None => return Err("database not found".into()),
     };
@@ -196,29 +210,21 @@ fn read_from_database(opt: ReadOpt) -> Result<(), MainError> {
         None => return Ok(()),
     };
 
-    let mut value_size = 0;
-    let mut codes = SmallVec8::new();
-
-    for c in code {
-        let code = Code::from(*c).unwrap();
-        value_size += code.size();
-        codes.push(code);
-    }
+    let codes = code.iter().map(|c| Code::from(*c).unwrap());
+    let codes = SmallVec8::from_iter(codes);
 
     let mut writer = BufWriter::new(io::stdout());
 
     for result in iter {
-        let (nanos, bytes) = result?;
+        let ((text, nanos), bytes) = result?;
 
         let dt = {
-            let secs = nanos.get() / ONE_BILLION;
-            let nsecs = nanos.get() % ONE_BILLION;
+            let secs = nanos / ONE_BILLION;
+            let nsecs = nanos % ONE_BILLION;
             let dt = NaiveDateTime::from_timestamp(secs as i64, nsecs as u32);
 
             dt.format(DATETIME_FORMAT)
         };
-
-        let text = str::from_utf8(&bytes[value_size..])?;
 
         if let Some(pattern) = opt.filter.as_ref() {
             if !pattern.matches(text) {
@@ -273,13 +279,13 @@ fn infos_of_database(opt: InfosOpt) -> Result<(), MainError> {
         .map_size(10 * 1024 * 1024 * 1024) // 10GB
         .open(opt.database)?;
 
-    let db = match env.open_database::<OwnedType<BEU64>, ByteSlice>(None)? {
+    let db = match env.open_database::<Key, ByteSlice>(None)? {
         Some(db) => db,
         None => return Err("database not found".into()),
     };
 
     let rtxn = env.read_txn()?;
-    let code = db.get(&rtxn, &BEU64::new(0))?;
+    let code = db.get(&rtxn, &("", 0))?;
     if let Some(code) = code {
         let code = str::from_utf8(code)?;
         println!("values code: {}", code);
