@@ -190,9 +190,10 @@ fn write_to_database(opt: WriteOpt) -> Result<(), MainError> {
 }
 
 fn read_from_database(opt: ReadOpt) -> Result<(), MainError> {
-    let env = EnvOpenOptions::new()
+    let env = unsafe { EnvOpenOptions::new()
         .map_size(10 * 1024 * 1024 * 1024) // 10GB
-        .open(opt.database)?;
+        .flag(heed::flags::Flags::MdbRdOnly)
+        .open(opt.database)? };
 
     let db = match env.open_database::<Key, ByteSlice>(None)? {
         Some(db) => db,
@@ -283,9 +284,10 @@ fn read_from_database(opt: ReadOpt) -> Result<(), MainError> {
 }
 
 fn infos_of_database(opt: InfosOpt) -> Result<(), MainError> {
-    let env = EnvOpenOptions::new()
+    let env = unsafe { EnvOpenOptions::new()
         .map_size(10 * 1024 * 1024 * 1024) // 10GB
-        .open(opt.database)?;
+        .flag(heed::flags::Flags::MdbRdOnly)
+        .open(opt.database)? };
 
     let db = match env.open_database::<Key, ByteSlice>(None)? {
         Some(db) => db,
